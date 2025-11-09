@@ -92,18 +92,28 @@ while True:
     try:
         threads = client.direct_threads(amount=10)
         two_minutes_ago = datetime.now() - timedelta(minutes=2)
+
         for thread in threads:
-            if len(thread.users) > 2:
+            if len(thread.users) > 2:  # Only process group chats
                 messages = client.direct_messages(thread.id, amount=20)
                 for msg in messages:
                     if msg.user_id == client.user_id:
                         continue
                     if msg.timestamp and msg.timestamp.replace(tzinfo=None) >= two_minutes_ago:
+                        mentioned = False
+
+                        # Check both structured mentions and plain-text mentions
                         if msg.mentions:
                             for mention in msg.mentions:
                                 if mention.user.username.lower() == client.username.lower():
-                                    handle_message(msg, thread.id)
+                                    mentioned = True
                                     break
+                        if not mentioned and f"@{client.username.lower()}" in msg.text.lower():
+                            mentioned = True
+
+                        if mentioned:
+                            handle_message(msg, thread.id)
+                            break
         time.sleep(10)
     except Exception as e:
         print(f"⚠️ Main loop error: {e}")
