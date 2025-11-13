@@ -1,3 +1,6 @@
 instagrapi
-dotenv
+python-dotenv
 flask
+requests
+pyyaml
+flask_limiter
