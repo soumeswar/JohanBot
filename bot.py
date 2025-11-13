@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
-Nefer Bot v3 - Industrial feature set for Instagram DMs using instagrapi.
-
-Features:
-- Concurrent message processing with ThreadPoolExecutor
-- SQLite persistence for processed messages, opt-outs, and logs
-- Rate limiting + backoff + retries
-- Admin commands and user commands
-- Pre-generation "Processing your request..." message
-- Image caching with cleanup
-- Optional OpenAI + Pollinations support
+Nefer Bot — All-in-one Instagram assistant (single-file).
+Features: robust login + session, challenge resolve, polling with backoff,
+threaded workers, AI hooks, likes/comments/reels upload, userinfo from url,
+sqlite persistence, token bucket rate limiting, image cache, admin commands.
 """
 
 import os
@@ -19,27 +13,21 @@ import sqlite3
 import logging
 import traceback
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Optional
-from collections import deque
-from dataclasses import dataclass, field
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 import requests
 from instagrapi import Client
-from instagrapi.types import DirectMessage
-from math import inf
-import shutil
-import yaml
-from tqdm import tqdm
 
-# ---------------------------
-# Load environment & config
-# ---------------------------
+# -------------------------
+# Load environment/config
+# -------------------------
 load_dotenv()
 
-# Core env
 INSTA_USERNAME = os.getenv("INSTA_USERNAME")
 INSTA_PASSWORD = os.getenv("INSTA_PASSWORD")
 SESSION_FILE = os.getenv("SESSION_FILE", "session.json")
@@ -48,50 +36,37 @@ IMAGE_CACHE_DIR = os.getenv("IMAGE_CACHE_DIR", "./image_cache")
 LOG_FILE = os.getenv("LOG_FILE", "nefer_bot.log")
 ADMIN_USERS = [u.strip().lower() for u in os.getenv("ADMIN_USERS", "").split(",") if u.strip()]
 AI_PROVIDER = os.getenv("AI_PROVIDER", "pollinations").lower()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-# Optional YAML config override
-CONFIG_YAML = os.getenv("CONFIG_YAML", "config.yaml")
-custom_cfg = {}
-if os.path.exists(CONFIG_YAML):
-    with open(CONFIG_YAML, "r") as f:
-        custom_cfg = yaml.safe_load(f) or {}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional
 
-# Merge defaults with YAML override
-CFG = {
-    "worker_threads": custom_cfg.get("worker_threads", 6),
-    "poll_interval": custom_cfg.get("poll_interval", 8),  # seconds
-    "max_messages_fetch": custom_cfg.get("max_messages_fetch", 25),
-    "message_stale_seconds": custom_cfg.get("message_stale_seconds", 300),
-    "image_cache_max_files": custom_cfg.get("image_cache_max_files", 200),
-    "image_cache_max_age_seconds": custom_cfg.get("image_cache_max_age_seconds", 60 * 60 * 24),
-    "max_text_length": custom_cfg.get("max_text_length", 2000),
-    "max_image_bytes": custom_cfg.get("max_image_bytes", 6 * 1024 * 1024),
-    "rate_limit_per_minute": custom_cfg.get("rate_limit_per_minute", 40),
-    "ai_timeout": custom_cfg.get("ai_timeout", 25),
-}
-# Create cache dir
+# runtime config (tweakable)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "8"))               # normal poll
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "5"))              # base backoff on failure
+BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "600"))                # cap backoff (s)
+WORKER_THREADS = int(os.getenv("WORKER_THREADS", "6"))
+MAX_IMAGE_CACHE = int(os.getenv("MAX_IMAGE_CACHE", "300"))
+IMAGE_MAX_AGE = int(os.getenv("IMAGE_MAX_AGE", str(60*60*24*7)))  # 7 days
+
 os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
 
-# ---------------------------
-# Logging setup (rotating simple)
-# ---------------------------
-logger = logging.getLogger("nefer_bot_v3")
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("nefer_bot")
 logger.setLevel(logging.DEBUG)
-fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
 fh = logging.FileHandler(LOG_FILE)
 fh.setLevel(logging.DEBUG)
+fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 fh.setFormatter(fmt)
 logger.addHandler(fh)
-
 sh = logging.StreamHandler()
-sh.setLevel(logging.INFO)
 sh.setFormatter(fmt)
+sh.setLevel(logging.INFO)
 logger.addHandler(sh)
 
-# ---------------------------
+# -------------------------
 # SQLite persistence
-# ---------------------------
+# -------------------------
+_db_lock = threading.Lock()
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
@@ -99,443 +74,651 @@ def init_db():
     CREATE TABLE IF NOT EXISTS processed (
         msg_id TEXT PRIMARY KEY,
         thread_id TEXT,
-        user TEXT,
-        timestamp INTEGER
-    )
-    """)
+        username TEXT,
+        ts INTEGER
+    )""")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS optouts (
         username TEXT PRIMARY KEY,
         reason TEXT,
         ts INTEGER
-    )
-    """)
+    )""")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER,
         level TEXT,
         message TEXT
-    )
-    """)
+    )""")
     conn.commit()
     return conn
 
-db_conn = init_db()
-db_lock = threading.Lock()
+db = init_db()
 
-def mark_processed(msg_id, thread_id, user):
-    with db_lock:
-        cur = db_conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO processed (msg_id, thread_id, user, timestamp) VALUES (?, ?, ?, ?)",
-                    (msg_id, thread_id, user, int(time.time())))
-        db_conn.commit()
+def mark_processed(msg_id, thread_id, username):
+    with _db_lock:
+        cur = db.cursor()
+        cur.execute("INSERT OR IGNORE INTO processed (msg_id, thread_id, username, ts) VALUES (?, ?, ?, ?)",
+                    (msg_id, thread_id, username, int(time.time())))
+        db.commit()
 
 def is_processed(msg_id):
-    with db_lock:
-        cur = db_conn.cursor()
+    with _db_lock:
+        cur = db.cursor()
         cur.execute("SELECT 1 FROM processed WHERE msg_id = ?", (msg_id,))
         return cur.fetchone() is not None
 
-def optout_user(username, reason=""):
-    with db_lock:
-        cur = db_conn.cursor()
+def optout_user(username, reason="user_requested"):
+    with _db_lock:
+        cur = db.cursor()
         cur.execute("INSERT OR REPLACE INTO optouts (username, reason, ts) VALUES (?, ?, ?)",
                     (username.lower(), reason, int(time.time())))
-        db_conn.commit()
+        db.commit()
 
 def optin_user(username):
-    with db_lock:
-        cur = db_conn.cursor()
+    with _db_lock:
+        cur = db.cursor()
         cur.execute("DELETE FROM optouts WHERE username = ?", (username.lower(),))
-        db_conn.commit()
+        db.commit()
 
 def is_opted_out(username):
-    with db_lock:
-        cur = db_conn.cursor()
+    with _db_lock:
+        cur = db.cursor()
         cur.execute("SELECT 1 FROM optouts WHERE username = ?", (username.lower(),))
         return cur.fetchone() is not None
 
 def db_log(level, message):
-    with db_lock:
-        cur = db_conn.cursor()
+    with _db_lock:
+        cur = db.cursor()
         cur.execute("INSERT INTO logs (ts, level, message) VALUES (?, ?, ?)", (int(time.time()), level, message))
-        db_conn.commit()
+        db.commit()
 
-# ---------------------------
+# -------------------------
 # Rate limiter (token bucket)
-# ---------------------------
+# -------------------------
 class TokenBucket:
-    def __init__(self, rate_per_minute):
-        self.capacity = rate_per_minute
-        self.tokens = rate_per_minute
-        self.refill_rate = rate_per_minute / 60.0
+    def __init__(self, rate_per_minute=60):
+        self.capacity = max(1, rate_per_minute)
+        self.tokens = float(self.capacity)
+        self.refill = self.capacity / 60.0
         self.last = time.time()
         self.lock = threading.Lock()
-
-    def consume(self, tokens=1):
+    def consume(self, n=1):
         with self.lock:
             now = time.time()
-            elapsed = now - self.last
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.refill)
             self.last = now
-            if self.tokens >= tokens:
-                self.tokens -= tokens
+            if self.tokens >= n:
+                self.tokens -= n
                 return True
             return False
 
-rate_limiter = TokenBucket(CFG["rate_limit_per_minute"])
+rate_limiter = TokenBucket(rate_per_minute=int(os.getenv("RATE_PER_MINUTE", "40")))
 
-# ---------------------------
-# AI provider abstraction
-# ---------------------------
-def ai_text_generate(prompt: str, timeout=CFG["ai_timeout"]) -> str:
-    """Try OpenAI (if configured) then fallback to Pollinations text endpoint."""
-    prompt = prompt.strip()
-    if len(prompt) == 0:
-        return "You sent an empty prompt."
+# -------------------------
+# AI provider functions
+# -------------------------
+def ai_text_generate(prompt, timeout=20):
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Empty prompt."
     if AI_PROVIDER == "openai" and OPENAI_API_KEY:
         try:
-            # Minimal OpenAI call using requests (no openai package required)
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-            data = {
-                "model": "gpt-3.5-turbo",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 600,
-            }
-            r = requests.post("https://api.openai.com/v1/chat/completions", json=data, headers=headers, timeout=timeout)
+            payload = {"model":"gpt-3.5-turbo","messages":[{"role":"user","content":prompt}], "max_tokens":400}
+            r = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=timeout)
             r.raise_for_status()
             j = r.json()
             return j["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning("OpenAI text generation failed, falling back. %s", e)
-    # Pollinations simple text fallback
+            logger.warning("OpenAI text failed, falling back to pollinations: %s", e)
+    # pollinations text fallback
     try:
         url = f"https://text.pollinations.ai/{requests.utils.requote_uri(prompt)}"
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         return r.text.strip()
     except Exception as e:
-        logger.exception("AI text generation failed: %s", e)
-        return "Sorry — I couldn't generate a reply right now."
+        logger.exception("AI text generation failed")
+        return "Sorry, couldn't generate text right now."
 
-def ai_image_generate(prompt: str, timeout=CFG["ai_timeout"]) -> Optional[BytesIO]:
-    """Try Pollinations image generator; optionally add OpenAI DALL·E path if API key provided."""
-    prompt = prompt.strip()
-    # Basic pollinations
+def ai_image_generate(prompt, timeout=25):
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None
+    # simple safety keyword check
+    nsfw_blacklist = {"nsfw","porn","sex","nude","xxx","illegal","bomb"}
+    if any(k in prompt.lower() for k in nsfw_blacklist):
+        logger.info("Blocked unsafe prompt")
+        return None
     try:
         url = f"https://image.pollinations.ai/prompt/{requests.utils.requote_uri(prompt)}"
         r = requests.get(url, timeout=timeout)
-        if r.status_code == 200 and len(r.content) <= CFG["max_image_bytes"]:
+        if r.status_code == 200 and r.content:
             return BytesIO(r.content)
-        logger.warning("Pollinations returned status %s or big image %s", r.status_code, len(r.content) if r.content else 0)
     except Exception:
-        logger.exception("Pollinations image generation failed.")
-    # Optional: OpenAI image generation (DALL·E)
+        logger.exception("Pollinations image failed")
+    # optionally fallback to OpenAI images if configured
     if OPENAI_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-            payload = {
-                "prompt": prompt,
-                "size": "1024x1024",
-                "n": 1
-            }
+            payload = {"prompt":prompt,"n":1,"size":"1024x1024"}
             r = requests.post("https://api.openai.com/v1/images/generations", json=payload, headers=headers, timeout=timeout)
             r.raise_for_status()
             j = r.json()
             b64 = j["data"][0]["b64_json"]
             import base64
-            img_bytes = base64.b64decode(b64)
-            if len(img_bytes) <= CFG["max_image_bytes"]:
-                return BytesIO(img_bytes)
+            return BytesIO(base64.b64decode(b64))
         except Exception:
-            logger.exception("OpenAI image generation failed.")
+            logger.exception("OpenAI image fallback failed")
     return None
 
-# ---------------------------
-# Safety filters (very simple)
-# ---------------------------
-NSFW_KEYWORDS = {"nsfw", "porn", "sex", "nude", "xxx", "illegal", "bomb"}
-def content_is_safe(prompt: str) -> bool:
-    lower = prompt.lower()
-    for k in NSFW_KEYWORDS:
-        if k in lower:
-            return False
-    return True
-
-# ---------------------------
+# -------------------------
 # Image cache helpers
-# ---------------------------
-def cache_image(img_io: BytesIO, prefix="img") -> str:
-    ts = int(time.time() * 1000)
+# -------------------------
+def cache_image_io(b: BytesIO, prefix="img"):
+    ts = int(time.time()*1000)
     filename = f"{prefix}_{ts}.jpg"
     path = os.path.join(IMAGE_CACHE_DIR, filename)
     with open(path, "wb") as f:
-        f.write(img_io.getbuffer())
-    enforce_cache_limits()
+        f.write(b.getbuffer())
+    _enforce_image_cache()
     return path
 
-def enforce_cache_limits():
-    files = sorted(
-        (os.path.join(IMAGE_CACHE_DIR, f) for f in os.listdir(IMAGE_CACHE_DIR)),
-        key=lambda p: os.path.getmtime(p)
-    )
-    # Remove old files exceeding count
-    while len(files) > CFG["image_cache_max_files"]:
-        rm = files.pop(0)
+def _enforce_image_cache():
+    files = sorted([os.path.join(IMAGE_CACHE_DIR, f) for f in os.listdir(IMAGE_CACHE_DIR)], key=os.path.getmtime)
+    # remove oldest if over limit
+    while len(files) > MAX_IMAGE_CACHE:
         try:
-            os.remove(rm)
-        except:
-            pass
-    # Remove old based on age
-    cutoff = time.time() - CFG["image_cache_max_age_seconds"]
-    for f in files:
+            os.remove(files.pop(0))
+        except: pass
+    # remove by age
+    cutoff = time.time() - IMAGE_MAX_AGE
+    for p in files:
         try:
-            if os.path.getmtime(f) < cutoff:
-                os.remove(f)
-        except:
-            pass
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except: pass
 
-# ---------------------------
-# Instagram client management
-# ---------------------------
+# -------------------------
+# Instagram client & login
+# -------------------------
 client_lock = threading.Lock()
-def create_client():
+client = None
+
+def create_client_instance():
     c = Client()
-    # optional: adjust c settings here (e.g., c.api_timeout)
+    # tweak device info? careful — keep reasonable
     return c
 
-client = create_client()
+def interactive_challenge_resolve(c: Client):
+    # instagrapi provides challenge_resolve helpers; here we drive simple flow:
+    try:
+        print("Challenge flow detected. Follow instructions from console and check your Instagram (app/email).")
+        c.challenge_resolve(c.last_json)
+        # if challenge asks for code, library usually prompts automatically;
+        # our earlier attempts had interactive prompts; we keep it simple:
+    except Exception as e:
+        logger.exception("Interactive challenge resolution failed: %s", e)
+        raise
+
 def login_client():
     global client
     with client_lock:
+        client = create_client_instance()
+        # try to load session
         try:
             if os.path.exists(SESSION_FILE):
                 client.load_settings(SESSION_FILE)
+                try:
+                    client.login(INSTA_USERNAME, INSTA_PASSWORD)
+                    client.dump_settings(SESSION_FILE)
+                    logger.info("Logged in using saved session.")
+                    db_log("INFO", "Logged in using saved session")
+                    return
+                except Exception as e:
+                    logger.warning("Saved session failed: %s — removing and retrying fresh login", e)
+                    try: os.remove(SESSION_FILE)
+                    except: pass
+            # fresh login
             client.login(INSTA_USERNAME, INSTA_PASSWORD)
             client.dump_settings(SESSION_FILE)
-            logger.info("Logged in as @%s", INSTA_USERNAME)
-            db_log("INFO", f"Logged in as {INSTA_USERNAME}")
+            logger.info("Fresh login success.")
+            db_log("INFO", "Fresh login success")
         except Exception as e:
-            logger.exception("Login failed: %s", e)
-            # attempt fresh client
+            # If challenge_required occurs, try to interactively resolve
+            logger.exception("Login attempt raised exception: %s", e)
+            # attempt to resolve challenge if available
             try:
-                if os.path.exists(SESSION_FILE):
-                    os.remove(SESSION_FILE)
-                client = create_client()
-                client.login(INSTA_USERNAME, INSTA_PASSWORD)
-                client.dump_settings(SESSION_FILE)
-                logger.info("Fresh login success.")
-            except Exception as e2:
-                logger.exception("Fresh login also failed: %s", e2)
+                if hasattr(client, "last_json") and client.last_json and "challenge" in json.dumps(client.last_json):
+                    logger.info("Attempting interactive challenge resolution...")
+                    interactive_challenge_resolve(client)
+                    # post-challenge, try to dump session
+                    try:
+                        client.dump_settings(SESSION_FILE)
+                    except:
+                        pass
+                else:
+                    raise
+            except Exception as ex:
+                logger.exception("Challenge resolution or login failed: %s", ex)
                 raise
 
-# login once at start
-login_client()
+# login at start
+try:
+    login_client()
+except Exception as e:
+    logger.exception("Initial login failed; exit. Fix login manually and rerun.")
+    raise SystemExit(1)
 
-# ---------------------------
-# Command parsing
-# ---------------------------
-@dataclass
-class CommandResult:
-    acted: bool = False
-    response_text: Optional[str] = None
-    send_image_path: Optional[str] = None
+# Small stabilization wait after challenge to avoid immediate 500s
+time.sleep(6)
 
-def parse_command_and_handle(msg: DirectMessage, thread_id: str, from_username: str) -> CommandResult:
+# -------------------------
+# Utility helpers for media/profile handling
+# -------------------------
+def extract_username_from_url(url_or_username):
+    # Accept username or profile URL (instagram.com/username)
+    s = (url_or_username or "").strip()
+    if not s:
+        return None
+    if s.startswith("http://") or s.startswith("https://"):
+        try:
+            p = urlparse(s)
+            parts = [x for x in p.path.split("/") if x]
+            if parts:
+                return parts[0]
+            return None
+        except:
+            return None
+    # may include @
+    return s.lstrip("@")
+
+def get_user_info_by_any(identifier):
+    # identifier: username or profile url
+    uname = extract_username_from_url(identifier)
+    if not uname:
+        return None
+    try:
+        u = client.user_info_by_username(uname)
+        # return safe subset
+        return {
+            "pk": u.pk,
+            "username": u.username,
+            "full_name": u.full_name,
+            "is_private": u.is_private,
+            "followers": getattr(u, "follower_count", None),
+            "following": getattr(u, "following_count", None),
+            "biography": getattr(u, "biography", ""),
+            "external_url": getattr(u, "external_url", ""),
+        }
+    except Exception as e:
+        logger.exception("Failed to get user info for %s: %s", uname, e)
+        return None
+
+def media_id_from_url(url):
+    # Instagram post URL patterns contain /p/ or /reel/ or /tv/
+    try:
+        if url.startswith("http"):
+            # instagrapi has media_pk_from_url
+            return client.media_pk_from_url(url)
+        # maybe the user provided a pk already
+        return url
+    except Exception as e:
+        logger.exception("Failed to parse media id from url: %s", e)
+        return None
+
+# -------------------------
+# Command parsing and handlers
+# -------------------------
+def send_text_thread(thread_id, text):
+    if not rate_limiter.consume(): 
+        logger.debug("Rate limiter blocked text send")
+        time.sleep(2)
+    try:
+        client.direct_send(text[:2000], thread_ids=[thread_id])
+    except Exception as e:
+        logger.exception("Failed to send text: %s", e)
+
+def send_photo_thread(thread_id, path, caption=""):
+    if not rate_limiter.consume(): 
+        logger.debug("Rate limiter blocked photo send")
+        time.sleep(2)
+    try:
+        with open(path, "rb") as f:
+            client.direct_send_photo(f, thread_ids=[thread_id], caption=caption)
+        return True
+    except Exception as e:
+        logger.exception("Failed to send photo: %s", e)
+        return False
+
+def send_video_thread(thread_id, path, caption=""):
+    if not rate_limiter.consume(): 
+        logger.debug("Rate limiter blocked video send")
+        time.sleep(2)
+    try:
+        with open(path, "rb") as f:
+            client.direct_send_video(f, thread_ids=[thread_id], caption=caption)
+        return True
+    except Exception as e:
+        logger.exception("Failed to send video: %s", e)
+        return False
+
+def handle_command_text(msg_text, thread_id, from_username):
     """
-    Recognizes commands:
-    - /help
-    - /image <prompt>  OR messages with 'imagine' keyword
-    - /text <prompt>
-    - /optout [reason]
-    - /optin
-    - /status (admin)
-    - /ban <username> (admin)
-    - /unban <username> (admin)
+    Parse incoming message text and run commands.
+    Commands:
+      /help
+      /text <prompt>
+      /image <prompt>   or contains 'imagine'
+      /like <post_url>
+      /comment <post_url> | comment here
+      /reel <local_video_path> | caption
+      /userinfo <profile_url or username>
+      /optout /optin
+      admin: /status /ban /unban /shutdown
     """
-    text = (msg.text or "").strip()
-    if not text:
-        return CommandResult(False, None, None)
-    lowered = text.lower()
-    # Admin commands available to ADMIN_USERS
-    tokens = text.split()
-    cmd = tokens[0].lstrip("/").lower() if tokens else ""
-    # Help
-    if cmd == "help" or lowered.startswith("help"):
+    if not msg_text:
+        return None, None  # no action
+
+    txt = msg_text.strip()
+    lower = txt.lower()
+
+    # simple prefix parse
+    if lower.startswith("/help") or lower.startswith("help"):
         help_msg = (
-            "Nefer Bot Commands:\n"
-            "/help - show this message\n"
-            "/image <prompt> or use 'imagine' - generate image\n"
-            "/text <prompt> - generate text reply\n"
-            "/optout - stop receiving replies from the bot\n"
-            "/optin - allow replies again\n"
-            "Admins: /status, /ban <user>, /unban <user>\n"
-            "Mention me with @yourusername to trigger.\n"
+            "Nefer Bot — commands:\n"
+            "/help - show commands\n"
+            "/text <prompt> - AI text reply\n"
+            "/image <prompt> OR include 'imagine' - AI image\n"
+            "/like <post_url> - like a post\n"
+            "/comment <post_url> | <comment> - comment on post\n"
+            "/reel <local_video_path> | <caption> - upload a reel (local file)\n"
+            "/userinfo <profile_url or username> - get profile info\n"
+            "/optout /optin - control replies\n"
+            "Admin: /status /ban <user> /unban <user> /shutdown\n"
         )
-        return CommandResult(True, help_msg, None)
+        return "text", help_msg
 
-    # optout / optin
-    if cmd == "optout":
-        optout_user(from_username, reason="user_requested")
-        return CommandResult(True, "You have opted out. I will not reply to your messages until you /optin.", None)
-    if cmd == "optin":
+    # optout/optin
+    if lower.startswith("/optout"):
+        optout_user(from_username)
+        return "text", "You have opted out. Use /optin to opt back in."
+    if lower.startswith("/optin"):
         optin_user(from_username)
-        return CommandResult(True, "You are opted in — I will reply to your messages again.", None)
+        return "text", "You have opted in. I will reply again."
 
-    # admin commands
+    # admin
     if from_username.lower() in ADMIN_USERS:
-        if cmd == "status":
-            return CommandResult(True, f"Bot running. Threads: {CFG['worker_threads']}. Rate limit: {CFG['rate_limit_per_minute']}/min", None)
-        if cmd == "ban" and len(tokens) >= 2:
-            to_ban = tokens[1].lstrip("@").lower()
-            optout_user(to_ban, reason="admin_ban")
-            return CommandResult(True, f"User @{to_ban} has been banned (opted out).", None)
-        if cmd == "unban" and len(tokens) >= 2:
-            to_unban = tokens[1].lstrip("@").lower()
-            optin_user(to_unban)
-            return CommandResult(True, f"User @{to_unban} has been unbanned.", None)
+        if lower.startswith("/status"):
+            st = f"Bot running. Threads: {WORKER_THREADS}. Rate: {rate_limiter.capacity}/min"
+            return "text", st
+        if lower.startswith("/ban "):
+            toks = txt.split()
+            if len(toks) >= 2:
+                target = toks[1].lstrip("@").lower()
+                optout_user(target, reason="admin_ban")
+                return "text", f"@{target} banned (opted out)."
+        if lower.startswith("/unban "):
+            toks = txt.split()
+            if len(toks) >= 2:
+                target = toks[1].lstrip("@").lower()
+                optin_user(target)
+                return "text", f"@{target} unbanned."
+        if lower.startswith("/shutdown"):
+            return "shutdown", "Shutting down as requested by admin."
 
-    # Image generation: explicit /image or 'imagine' keyword
-    if cmd == "image" and len(tokens) >= 2:
-        prompt = text.partition(" ")[2].strip()
-        if not content_is_safe(prompt):
-            return CommandResult(True, "Your prompt seems to contain unsafe terms; cannot generate.", None)
-        img_io = ai_image_generate(prompt)
-        if img_io:
-            path = cache_image(img_io, prefix=f"img_{from_username}")
-            return CommandResult(True, "Here is your generated image:", path)
+    # /text
+    if lower.startswith("/text "):
+        prompt = txt.partition(" ")[2].strip()
+        # respond with pre-message then generate
+        return "aitext", prompt
+
+    # /image
+    if lower.startswith("/image "):
+        prompt = txt.partition(" ")[2].strip()
+        return "aiimage", prompt
+
+    # contains imagine (inline)
+    if "imagine" in lower:
+        idx = lower.find("imagine")
+        prompt = txt[idx + len("imagine"):].strip() or txt
+        return "aiimage", prompt
+
+    # /like
+    if lower.startswith("/like "):
+        target = txt.partition(" ")[2].strip()
+        return "like", target
+
+    # /comment
+    if lower.startswith("/comment "):
+        rest = txt.partition(" ")[2].strip()
+        # support "url | comment"
+        if "|" in rest:
+            url_part, _, comment_part = rest.partition("|")
+            return "comment", (url_part.strip(), comment_part.strip())
         else:
-            return CommandResult(True, "Sorry, I couldn't generate the image right now.", None)
+            return "comment", (rest, "")
 
-    if "imagine" in lowered:
-        # take text after 'imagine' or entire text
-        idx = lowered.find("imagine")
-        prompt = text[idx + len("imagine"):].strip() or text
-        if not content_is_safe(prompt):
-            return CommandResult(True, "Your prompt seems to contain unsafe terms; cannot generate.", None)
-        img_io = ai_image_generate(prompt)
-        if img_io:
-            path = cache_image(img_io, prefix=f"img_{from_username}")
-            return CommandResult(True, "Here is your generated image:", path)
+    # /reel
+    if lower.startswith("/reel "):
+        rest = txt.partition(" ")[2].strip()
+        if "|" in rest:
+            path, _, cap = rest.partition("|")
+            return "reel", (path.strip(), cap.strip())
         else:
-            return CommandResult(True, "Sorry, I couldn't generate the image right now.", None)
+            return "reel", (rest, "")
 
-    # Text generation: /text or fallback
-    if cmd == "text" and len(tokens) >= 2:
-        prompt = text.partition(" ")[2].strip()
-        if not content_is_safe(prompt):
-            return CommandResult(True, "Your prompt seems to contain unsafe terms; cannot generate.", None)
-        reply = ai_text_generate(prompt)
-        return CommandResult(True, reply, None)
+    # /userinfo
+    if lower.startswith("/userinfo "):
+        param = txt.partition(" ")[2].strip()
+        return "userinfo", param
 
-    # fallback: treat as plain text prompt to AI
-    if len(text) > 0:
-        if not content_is_safe(text):
-            return CommandResult(True, "Your message seems to contain disallowed content; cannot process.", None)
-        reply = ai_text_generate(text)
-        return CommandResult(True, reply, None)
+    # fallback: treat as AI text prompt
+    # but don't do so if user opted out
+    return "aitext", txt
 
-    return CommandResult(False, None, None)
-
-# ---------------------------
-# Worker logic
-# ---------------------------
-executor = ThreadPoolExecutor(max_workers=CFG["worker_threads"])
-work_queue = deque()  # queue of (msg, thread_id, username)
-
-def send_text_safe(thread_id: str, text: str):
-    """Rate-limited send with retries"""
-    backoff = 1
-    for attempt in range(6):
-        if rate_limiter.consume():
-            try:
-                client.direct_send(text[:CFG["max_text_length"]], thread_ids=[thread_id])
-                return True
-            except Exception as e:
-                logger.exception("Failed to send text (attempt %s): %s", attempt+1, e)
-        time.sleep(backoff)
-        backoff = min(30, backoff * 2)
-    return False
-
-def send_image_safe(thread_id: str, image_path: str, caption: Optional[str] = None):
-    backoff = 1
-    for attempt in range(6):
-        if rate_limiter.consume():
-            try:
-                with open(image_path, "rb") as f:
-                    client.direct_send_photo(f, thread_ids=[thread_id], caption=caption or "")
-                return True
-            except Exception as e:
-                logger.exception("Failed to send image (attempt %s): %s", attempt+1, e)
-        time.sleep(backoff)
-        backoff = min(30, backoff * 2)
-    return False
+# -------------------------
+# Worker: process a single DM message
+# -------------------------
+executor = ThreadPoolExecutor(max_workers=WORKER_THREADS)
 
 def worker_process(msg, thread_id, from_username):
     try:
-        if is_processed(msg.id):
-            logger.debug("Already processed %s", msg.id)
+        mid = getattr(msg, "id", None) or str(time.time())
+        if is_processed(mid):
+            logger.debug("Already processed %s", mid)
             return
-        # Respect opt-out
         if is_opted_out(from_username):
             logger.info("User %s opted out; skipping", from_username)
-            mark_processed(msg.id, thread_id, from_username)
+            mark_processed(mid, thread_id, from_username)
             return
 
-        # Send pre-processing confirmation
+        text = getattr(msg, "text", "") or ""
+        logger.info("Processing msg from %s: %s", from_username, text[:120])
+
+        # send pre-confirmation
         try:
-            # attempt to send confirmation (not guaranteed)
-            send_text_safe(thread_id, "⏳ Processing your request...")
+            send_text_thread(thread_id, "⏳ Processing your request...")
         except Exception:
             pass
 
-        # Parse and handle commands (including AI generation)
-        res = parse_command_and_handle(msg, thread_id, from_username)
-        if res.acted:
-            if res.send_image_path:
-                ok = send_image_safe(thread_id, res.send_image_path, caption=res.response_text)
-                if ok:
-                    logger.info("Sent image to %s", from_username)
-                    db_log("INFO", f"Image sent to {from_username}")
-                else:
-                    send_text_safe(thread_id, "Sorry, could not send the image after multiple tries.")
-            elif res.response_text is not None:
-                send_text_safe(thread_id, res.response_text)
-                logger.info("Sent text to %s", from_username)
-                db_log("INFO", f"Text sent to {from_username}")
+        kind, payload = handle_command_text(text, thread_id, from_username)
+
+        if kind == "text":
+            send_text_thread(thread_id, payload)
+
+        elif kind == "aitext":
+            prompt = payload
+            reply = ai_text_generate(prompt)
+            send_text_thread(thread_id, reply)
+
+        elif kind == "aiimage":
+            prompt = payload
+            img_io = ai_image_generate(prompt)
+            if img_io:
+                path = cache_image_io(img_io, prefix=f"{from_username}")
+                ok = send_photo_thread(thread_id, path, caption=f"Image for: {prompt[:120]}")
+                if not ok:
+                    send_text_thread(thread_id, "Sorry, couldn't send the image.")
             else:
-                logger.debug("No send needed for %s", msg.id)
+                send_text_thread(thread_id, "Sorry, couldn't generate the image (maybe blocked or failed).")
+
+        elif kind == "like":
+            target = payload
+            media_pk = None
+            try:
+                media_pk = media_id_from_url(target)
+                if media_pk:
+                    client.media_like(media_pk)
+                    send_text_thread(thread_id, "✅ Liked that post.")
+                else:
+                    send_text_thread(thread_id, "Couldn't detect media from that URL.")
+            except Exception as e:
+                logger.exception("Like failed")
+                send_text_thread(thread_id, f"Failed to like: {e}")
+
+        elif kind == "comment":
+            url_part, comment_text = payload
+            try:
+                media_pk = media_id_from_url(url_part)
+                if not media_pk:
+                    send_text_thread(thread_id, "Couldn't detect media from that URL.")
+                else:
+                    if not comment_text:
+                        send_text_thread(thread_id, "Please provide comment text after '|' in the command.")
+                    else:
+                        client.media_comment(media_pk, comment_text)
+                        send_text_thread(thread_id, "✅ Comment posted.")
+            except Exception as e:
+                logger.exception("Comment failed")
+                send_text_thread(thread_id, f"Failed to comment: {e}")
+
+        elif kind == "reel":
+            local_path, caption = payload
+            if not os.path.exists(local_path):
+                send_text_thread(thread_id, "Local file not found. Provide a valid path.")
+            else:
+                try:
+                    # attempt video upload as reel; instagrapi exposes video_upload and reel_upload functions in some versions
+                    try:
+                        client.video_upload(local_path, caption=caption)
+                        send_text_thread(thread_id, "✅ Reel uploaded (via video_upload).")
+                    except Exception:
+                        # fallback: try clip/reel upload if available
+                        try:
+                            client.reel_upload(local_path, caption=caption)
+                            send_text_thread(thread_id, "✅ Reel uploaded (via reel_upload).")
+                        except Exception:
+                            raise
+                except Exception as e:
+                    logger.exception("Reel upload failed")
+                    send_text_thread(thread_id, f"Failed to upload reel: {e}")
+
+        elif kind == "userinfo":
+            param = payload
+            info = get_user_info_by_any(param)
+            if info:
+                s = json.dumps(info, indent=2, ensure_ascii=False)
+                send_text_thread(thread_id, f"User info:\n{s}")
+            else:
+                send_text_thread(thread_id, "Could not fetch user info (maybe private or not found).")
+
+        elif kind == "shutdown":
+            send_text_thread(thread_id, "Shutting down as requested by admin.")
+            logger.info("Shutdown requested by admin %s", from_username)
+            os._exit(0)
+
         else:
-            # nothing recognized; mark processed
-            logger.debug("No action for msg %s", msg.id)
-
-        mark_processed(msg.id, thread_id, from_username)
+            # unknown action — ignore or reply
+            logger.debug("Unknown action kind=%s payload=%s", kind, payload)
+            # mark processed anyway
+        mark_processed(mid, thread_id, from_username)
     except Exception:
-        logger.exception("Error in worker_process for msg %s", getattr(msg, "id", "<no id>"))
+        logger.exception("Error in worker_process")
 
-# ---------------------------
-# Main polling loop
-# ---------------------------
+# -------------------------
+# Polling loop with backoff & jitter — robust
+# -------------------------
 def run_polling_loop():
-    logger.info("Starting main loop. Poll interval: %ss", CFG["poll_interval"])
+    backoff = BACKOFF_BASE
+    jitter = lambda: random.uniform(0.0, 2.0)
+    logger.info("Starting polling loop (poll interval %ss)", POLL_INTERVAL)
     while True:
         try:
-            # refresh client if needed
-            try:
-                if not client.user_id:
-                    login_client()
-            except Exception:
-                logger.exception("Client validation/login failed.")
+            # ensure client valid
+            if not client or not getattr(client, "user_id", None):
+                logger.warning("Client not logged in, attempting re-login...")
+                login_client()
+                time.sleep(5)
 
+            # fetch threads (safe)
             threads = client.direct_threads(amount=10)
-            logger.debug("Found %s threads", len(threads))
-            two_minutes_ago = datetime.now() - timedelta(seconds=CFG["message_stale_seconds"])
+            logger.debug("Fetched %d threads", len(threads))
 
-            tasks = []
             for thread in threads:
-                # fetch recent messages for that thread
+                # fetch recent messages
                 try:
-                    messages = client.direct_messages(thread.id, amount=CFG["max_messages_fetch"])
-                except Exception:
-              
+                    messages = client.direct_messages(thread.id, amount=10)
+                except Exception as e:
+                    logger.exception("Failed to fetch messages for thread %s: %s", getattr(thread, "id", "<no id>"), e)
+                    continue
+                for msg in messages:
+                    # skip messages sent by bot itself
+                    if getattr(msg, "user_id", None) == client.user_id:
+                        continue
+                    # timestamp filter: consider last 5 minutes
+                    ts = getattr(msg, "timestamp", None)
+                    if ts:
+                        try:
+                            tsnaive = ts.replace(tzinfo=None)
+                            if tsnaive < datetime.now() - timedelta(minutes=10):
+                                continue
+                        except:
+                            pass
+                    # detect mentions or private chat
+                    mentioned = False
+                    try:
+                        if getattr(msg, "mentions", None):
+                            for m in msg.mentions:
+                                try:
+                                    if m.user.username.lower() == client.username.lower():
+                                        mentioned = True
+                                        break
+                                except:
+                                    pass
+                        if not mentioned and getattr(msg, "text", "") and f"@{client.username.lower()}" in msg.text.lower():
+                            mentioned = True
+                    except Exception:
+                        pass
+                    # is private?
+                    users = getattr(thread, "users", []) or []
+                    is_private = len(users) <= 2
+                    should_process = mentioned or is_private
+                    if should_process:
+                        mid = getattr(msg, "id", None) or str(time.time())
+                        if not is_processed(mid):
+                            # submit worker
+                            executor.submit(worker_process, msg, thread.id, getattr(msg, "user", getattr(msg, "user_id", "unknown")))
+            # success -> reset backoff
+            backoff = BACKOFF_BASE
+            # sleep a randomized poll interval to avoid pattern detection
+            time.sleep(POLL_INTERVAL + random.uniform(0.0, 2.0))
+        except Exception as e:
+            logger.exception("Main polling loop error: %s", e)
+            # incremental backoff (exponential with cap)
+            logger.info("Backing off for %s seconds (with jitter)", backoff)
+            time.sleep(backoff + jitter())
+            backoff = min(backoff * 2, BACKOFF_MAX)
+
+# run
+if __name__ == "__main__":
+    logger.info("Nefer Bot starting up...")
+    try:
+        run_polling_loop()
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by keyboard interrupt.")
+    except SystemExit:
+        logger.info("System exit invoked.")
+    except Exception:
+        logger.exception("Unhandled exception in main")
