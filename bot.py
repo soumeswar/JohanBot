@@ -22,7 +22,9 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from urllib.parse import urlparse
 from dotenv import load_dotenv
-
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import sys
+import binascii
 import aiohttp
 import requests  # still used in a few places, preserved
 from instagrapi import Client
@@ -73,6 +75,32 @@ sh = logging.StreamHandler()
 sh.setFormatter(fmt)
 sh.setLevel(logging.INFO)
 logger.addHandler(sh)
+
+def decrypt_and_overwrite(hex_key: str, path="session.json"):
+    # convert hex string key → bytes
+    key = binascii.unhexlify(hex_key)
+
+    aes = AESGCM(key)
+
+    # read encrypted file
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    nonce = raw[:12]
+    ciphertext = raw[12:]
+
+    # decrypt
+    decrypted = aes.decrypt(nonce, ciphertext, None)
+
+    # convert bytes → json object
+    data = json.loads(decrypted)
+
+    # overwrite the same file with pretty JSON
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+
+    print("Decrypted and overwritten session.json ✔")
+
 
 # -------------------------
 # SQLite persistence
@@ -849,6 +877,7 @@ async def polling_loop():
 # Entrypoint
 # -------------------------
 def main():
+    decrypt_and_overwrite(JSON_DECRYPT_KEY)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -880,3 +909,4 @@ if __name__ == "__main__":
     logger.info("Nefer Bot starting up (async ai + threadpool for instagrapi)...")
     db_log("INFO", "Nefer Bot starting up (async)")
     main()
+
