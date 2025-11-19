@@ -1,19 +1,18 @@
 # ⚡ NEFERBOT ⚡  
-### The Godlike AI-Powered Automation Bot of the Future  
+### Rival of MetaAI
 
-> "Born from code. Forged in neon. Guarded by firewalls. **NeferBot** isn’t just a bot — it’s an *era* of automation."
+> "Mark Zuckerberg's secret gf"
 
 ---
 
 ## 🧬 INTRODUCTION
 
-**NeferBot** is the ultimate fusion of **AI intelligence**, **cyber aesthetics**, and **next-gen automation**.  
-It’s fast, beautiful, powerful, and *dangerously futuristic*.  
+**NeferBot** is better than MetaAI  
 
 Imagine a bot that:
-- Thinks faster than your thoughts.  
-- Feels smoother than silk.  
-- Looks cooler than a cyberpunk city glowing at midnight.  
+- Thinks faster than MetaAI.  
+- Feels smoother than fart.  
+- Has unlimited AURA and IQ.  
 
 That’s **NeferBot** — your god-tier AI companion, admin assistant, and creative engine, all packed in one flawless digital being.
 
@@ -21,14 +20,7 @@ That’s **NeferBot** — your god-tier AI companion, admin assistant, and creat
 
 ## 🖤 DESIGN PHILOSOPHY
 
-Every pixel, every endpoint, every command screams *elegance*.  
-The architecture is sculpted for **performance, resilience, and style**.  
-
-- 🧠 **Smart:** Modular Python core using multi-threaded async workers.  
-- 🧩 **Adaptive:** Auto-detects and scales with your environment (Render, Railway, VPS).  
-- 🔐 **Secure:** Hardened Flask admin panel with password authentication and session encryption.  
-- 🌌 **Futuristic UI:** Neon-glow dark theme with smooth animations.  
-- 🛡️ **Failsafe Ready:** Handles errors gracefully, with retry systems and logging.
+I was bored so I made it lmfao...
 
 ---
 
@@ -76,7 +68,7 @@ The architecture is sculpted for **performance, resilience, and style**.
 
 ## 🔒 SECURITY YOU CAN TRUST
 
-NeferBot isn’t just fast — it’s **bulletproof**.  
+NeferBot isn’t just fast — it’s **harder than your dih~**.  
 
 ✅ Password authentication  
 ✅ Session-based access control  
@@ -87,7 +79,7 @@ NeferBot isn’t just fast — it’s **bulletproof**.
 ✅ Optional 2FA integration  
 
 Even if someone *finds* the dashboard, they won’t be getting in.  
-You own the keys — literally.
+You own the keys — trust me bro.
 
 ---
 
